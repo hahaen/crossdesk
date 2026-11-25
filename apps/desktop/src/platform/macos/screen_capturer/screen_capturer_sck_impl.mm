@@ -38,6 +38,17 @@ class ScreenCapturerSckImpl;
 static const int kFullDesktopScreenId = -1;
 static constexpr auto kCaptureStartTimeout = std::chrono::seconds(5);
 
+enum class CaptureInterruption { failure, display_loss, user_stop };
+
+static CaptureInterruption ClassifyCaptureError(NSError* error) {
+  if ([error.domain isEqualToString:SCStreamErrorDomain]) {
+    if (error.code == SCStreamErrorUserStopped) return CaptureInterruption::user_stop;
+    if (error.code == SCStreamErrorNoCaptureSource || error.code == SCStreamErrorNoDisplayList)
+      return CaptureInterruption::display_loss;
+  }
+  return CaptureInterruption::failure;
+}
+
 static std::string NSErrorToString(NSError *error) {
   if (!error) {
     return "";
@@ -127,7 +138,7 @@ API_AVAILABLE(macos(14.0))
 - (instancetype)initWithCapturer:(ScreenCapturerSckImpl *)capturer;
 
 - (void)onShareableContentCreated:(SCShareableContent *)content generation:(uint64_t)generation
-                       revision:(uint64_t)revision;
+                       revision:(uint64_t)revision error:(NSError*)error;
 
 // Called just before the capturer is destroyed. This avoids a dangling pointer,
 // and prevents any new calls into a deleted capturer. If any method-call on the
@@ -167,9 +178,16 @@ class API_AVAILABLE(macos(14.0)) ScreenCapturerSckImpl : public ScreenCapturer {
 
   std::vector<DisplayInfo> GetDisplayInfoList() override {
     std::lock_guard<std::mutex> lock(lock_);
-    return display_info_list_;
+    auto displays = display_info_list_;
+    if (capture_requested_ && !stream_running_ && !displays.empty()) {
+      // Preserve the negotiated slot, but suspend input until SCK has a target.
+      auto& target = displays[current_monitor_index_];
+      target = DisplayInfo(nullptr, target.name, false, 0, 0, 0, 0);
+    }
+    return displays;
   }
   int ResetToInitialMonitor() override;
+  bool RefreshIdleDisplays(const std::function<bool(size_t)>& accept) override;
 
  private:
   std::vector<DisplayInfo> display_info_list_;
@@ -182,6 +200,7 @@ class API_AVAILABLE(macos(14.0)) ScreenCapturerSckImpl : public ScreenCapturer {
   bool stream_running_ = false;
   bool received_frame_ = false;
   bool recovery_pending_ = false;
+  bool awaiting_recovery_filter_ = false;
   unsigned recovery_attempt_ = 0;
   uint64_t capture_session_ = 0;
   using Clock = std::chrono::steady_clock;
@@ -189,6 +208,8 @@ class API_AVAILABLE(macos(14.0)) ScreenCapturerSckImpl : public ScreenCapturer {
   Clock::time_point configuration_started_{};
   Clock::time_point suspended_since_{};
   Clock::time_point next_recovery_{};
+  Clock::time_point refresh_displays_after_{};
+  void SetCaptureDisplays(const std::vector<CGDirectDisplayID>& display_ids);
   bool invalid_stream_id_logged_ = false;
   bool native_output_logged_ = false;
   PrivacyController* privacy_ = nullptr;
@@ -201,13 +222,20 @@ class API_AVAILABLE(macos(14.0)) ScreenCapturerSckImpl : public ScreenCapturer {
   // Called by SckHelper when shareable content is returned by ScreenCaptureKit. `content` will be
   // nil if an error occurred. May run on an arbitrary thread.
   void OnShareableContentCreated(SCShareableContent *content, uint64_t generation,
-                                uint64_t revision);
+                                uint64_t revision, NSError* error);
   void ConfigurationFinished(SCStream* source, uint64_t generation, uint64_t revision,
                              bool complete, SCStreamConfiguration* configuration,
                              NSError* error);
   void RetryPrivacyFilter();
   bool CheckCaptureHealth(uint64_t session);
   void CaptureConfigurationChanged() { StartOrReconfigureCapturer(); }
+  void ScreenParametersChanged() {
+    {
+      std::lock_guard lock(lock_);
+      refresh_displays_after_ = Clock::now() + std::chrono::seconds(2);
+    }
+    StartOrReconfigureCapturer();
+  }
   void CaptureStopped(SCStream* source, NSError* error);
   void CaptureSuspended(SCStream* source);
   // Called by SckHelper to notify of a newly captured frame. May run on an arbitrary thread.
@@ -220,7 +248,8 @@ class API_AVAILABLE(macos(14.0)) ScreenCapturerSckImpl : public ScreenCapturer {
   // the existing stream. Runs on the caller's thread.
   void StartOrReconfigureCapturer();
   void RecoverCapture(uint64_t generation, const std::string& reason,
-                      SCStream* stopped_stream = nil, bool retry = true);
+                      CaptureInterruption cause = CaptureInterruption::failure,
+                      SCStream* stopped_stream = nil);
   // Helper object to receive Objective-C callbacks from ScreenCaptureKit and call into this C++
   // object. The helper may outlive this C++ instance, if a completion-handler is passed to
   // ScreenCaptureKit APIs and the C++ object is deleted before the handler executes.
@@ -335,21 +364,22 @@ ScreenCapturerSckImpl::~ScreenCapturerSckImpl() {
   Destroy();
 }
 
-static std::vector<CGDirectDisplayID> GetOnlineCaptureDisplays() {
+static bool GetOnlineCaptureDisplays(std::vector<CGDirectDisplayID>& displays) {
   uint32_t count = 0;
-  if (CGGetOnlineDisplayList(0, nullptr, &count) != kCGErrorSuccess || !count)
-    return {};
-
-  std::vector<CGDirectDisplayID> displays(count);
-  if (CGGetOnlineDisplayList(count, displays.data(), &count) != kCGErrorSuccess)
-    return {};
+  if (CGGetOnlineDisplayList(0, nullptr, &count) != kCGErrorSuccess) return false;
+  displays.resize(count);
+  if (!count) return true;
+  if (CGGetOnlineDisplayList(count, displays.data(), &count) != kCGErrorSuccess) {
+    displays.clear();
+    return false;
+  }
   displays.resize(count);
   displays.erase(std::remove_if(displays.begin(), displays.end(),
                                 [](CGDirectDisplayID id) {
                                   return CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay;
                                 }),
                  displays.end());
-  return displays;
+  return true;
 }
 
 int ScreenCapturerSckImpl::Init(const int fps, cb_desktop_data cb) {
@@ -360,8 +390,6 @@ int ScreenCapturerSckImpl::Init(const int fps, cb_desktop_data cb) {
 
   _on_data = cb;
   fps_ = fps > 0 ? fps : 60;
-  display_info_list_.clear();
-  display_id_map_.clear();
   native_output_logged_ = false;
 
   if (@available(macOS 10.15, *)) {
@@ -402,10 +430,18 @@ int ScreenCapturerSckImpl::Init(const int fps, cb_desktop_data cb) {
   if (display_ids.empty()) {
     // Sleeping displays can disappear from ScreenCaptureKit before a peer
     // negotiates its streams. CoreGraphics can still enumerate online outputs.
-    display_ids = GetOnlineCaptureDisplays();
+    GetOnlineCaptureDisplays(display_ids);
     LOG_WARN("ScreenCaptureKit display enumeration unavailable; found {} online displays",
              display_ids.size());
   }
+  std::lock_guard lock(lock_);
+  SetCaptureDisplays(display_ids);
+  return 0;
+}
+
+void ScreenCapturerSckImpl::SetCaptureDisplays(const std::vector<CGDirectDisplayID>& display_ids) {
+  display_info_list_.clear();
+  display_id_map_.clear();
   if (display_ids.empty()) {
     // Reserve Display1 even when WindowServer exposes no physical display.
     // The first successful refresh binds this slot to its real ID and bounds.
@@ -438,7 +474,29 @@ int ScreenCapturerSckImpl::Init(const int fps, cb_desktop_data cb) {
   current_monitor_index_ = initial_monitor_index_;
   current_display_ = display_id_map_[current_monitor_index_];
   current_stream_id_ = MakeDisplayStreamId(current_monitor_index_);
-  return 0;
+}
+
+bool ScreenCapturerSckImpl::RefreshIdleDisplays(const std::function<bool(size_t)>& accept) {
+  std::lock_guard lock(lock_);
+  const auto now = Clock::now();
+  if (capture_requested_ || refresh_displays_after_ == Clock::time_point{} ||
+      now < refresh_displays_after_) return false;
+
+  // WindowServer can report several intermediate layouts during a mode switch.
+  // Keep the previous snapshot on enumeration failure or concurrent admission.
+  refresh_displays_after_ = now + std::chrono::seconds(1);
+  std::vector<CGDirectDisplayID> ids;
+  if (!GetOnlineCaptureDisplays(ids) || !accept(std::max<size_t>(1, ids.size()))) return false;
+  // Keep surviving displays in their previous slots when WindowServer changes
+  // enumeration order. Fill a vacated slot with a replacement or a new screen.
+  for (size_t slot = 0; slot < ids.size() && slot < display_info_list_.size(); ++slot) {
+    const auto previous = display_id_map_.at(slot);
+    const auto found = std::find(ids.begin(), ids.end(), previous);
+    if (found != ids.end()) std::iter_swap(ids.begin() + slot, found);
+  }
+  SetCaptureDisplays(ids);
+  refresh_displays_after_ = {};
+  return true;
 }
 
 int ScreenCapturerSckImpl::Start(bool show_cursor) {
@@ -539,6 +597,7 @@ int ScreenCapturerSckImpl::Destroy() {
 int ScreenCapturerSckImpl::Stop() {
   std::lock_guard<std::mutex> lock(lock_);
   capture_requested_ = false;
+  awaiting_recovery_filter_ = false;
   stream_running_ = received_frame_ = recovery_pending_ = false;
   recovery_attempt_ = 0;
   suspended_since_ = {};
@@ -557,7 +616,8 @@ int ScreenCapturerSckImpl::Stop() {
 }
 
 void ScreenCapturerSckImpl::OnShareableContentCreated(SCShareableContent *content,
-                                                     uint64_t generation, uint64_t revision) {
+                                                     uint64_t generation, uint64_t revision,
+                                                     NSError* error) {
   {
     std::lock_guard<std::mutex> lock(lock_);
     if (!capture_requested_ || generation != configuration_generation_) {
@@ -574,13 +634,15 @@ void ScreenCapturerSckImpl::OnShareableContentCreated(SCShareableContent *conten
     return;
   }
 
-  if (!content) {
-    RecoverCapture(generation, "getShareableContent failed");
+  if (error || !content) {
+    RecoverCapture(generation, "getShareableContent failed: " + NSErrorToString(error),
+                   ClassifyCaptureError(error));
     return;
   }
 
   if (!content.displays || content.displays.count == 0) {
-    RecoverCapture(generation, "getShareableContent returned no displays");
+    RecoverCapture(generation, "getShareableContent returned no displays",
+                   CaptureInterruption::display_loss);
     return;
   }
 
@@ -609,7 +671,8 @@ void ScreenCapturerSckImpl::OnShareableContentCreated(SCShareableContent *conten
     if (!captured_display) {
       captured_display = logical_fallback ? logical_fallback
                                           : content.displays.firstObject;
-      if (!logical_fallback) logical_index = 0;
+      // The viewer and input still use the selected slot, even when SCK
+      // falls back to its first display. Bind that slot to the new geometry.
     }
 
     if (captured_display) {
@@ -626,7 +689,6 @@ void ScreenCapturerSckImpl::OnShareableContentCreated(SCShareableContent *conten
       current_monitor_index_ = logical_index;
       current_display_ = new_display;
       current_stream_id_ = stable_stream_id;
-      display_id_map_[logical_index] = new_display;
 
       CGRect bounds = CGDisplayBounds(new_display);
       auto& info = display_info_list_[logical_index];
@@ -653,7 +715,7 @@ void ScreenCapturerSckImpl::OnShareableContentCreated(SCShareableContent *conten
   }
 
   if (!captured_display) {
-    RecoverCapture(generation, "Failed to find valid display");
+    RecoverCapture(generation, "Failed to find valid display", CaptureInterruption::display_loss);
     return;
   }
 
@@ -675,15 +737,21 @@ void ScreenCapturerSckImpl::OnShareableContentCreated(SCShareableContent *conten
            generation, privacy_capture.revision, excluded_ids.size(),
            excluded.count);
   if (!privacy_filter_complete) {
-    bool have_stream;
-    { std::lock_guard lock(lock_); have_stream = stream_ != nil; }
-    if (privacy_capture.applied_revision == privacy_capture.revision) {
+    bool wait_for_windows, layout_settling;
+    {
+      std::lock_guard lock(lock_);
+      wait_for_windows = stream_ != nil || awaiting_recovery_filter_;
+      layout_settling = Clock::now() < refresh_displays_after_;
+    }
+    // A departing display may take its window out of SCK's list before
+    // AppKit publishes the replacement covers. Keep the last complete filter.
+    if (privacy_capture.applied_revision == privacy_capture.revision && !layout_settling) {
       if (privacy_) privacy_->Fail("ScreenCaptureKit could not enumerate every privacy cover");
       return; // Preserve the existing exclusion until recovery removes covers.
     }
-    if (have_stream) {
+    if (wait_for_windows) {
       RetryPrivacyFilter();
-      return; // Transparent covers are still being registered by WindowServer.
+      return;
     }
     // Start ordinary capture even if a newly created, still-transparent cover
     // is not enumerable yet. Retry exclusion after start; never acknowledge it.
@@ -803,8 +871,12 @@ void ScreenCapturerSckImpl::ConfigurationFinished(SCStream* source, uint64_t gen
       stream_running_ = true;
       applied_configuration_ = configuration;
       if (privacy_) privacy_->CaptureChanged(true);
-      if (complete && !refresh && generation == configuration_generation_)
-        AcknowledgeMacPrivacyCapture(revision);
+      if (complete && !refresh) {
+        if (AcknowledgeMacPrivacyCapture(revision))
+          awaiting_recovery_filter_ = false;
+        else
+          refresh = true;
+      }
       refresh = refresh || !complete;
     }
     LOG_INFO("macOS privacy filter completed: generation={}, revision={}, complete={}, refresh={}, error={}",
@@ -812,7 +884,7 @@ void ScreenCapturerSckImpl::ConfigurationFinished(SCStream* source, uint64_t gen
   }
   if (error) {
     RecoverCapture(generation, "ScreenCaptureKit configuration failed: " +
-                                  NSErrorToString(error));
+                                  NSErrorToString(error), ClassifyCaptureError(error));
     return;
   }
   if (refresh) RetryPrivacyFilter();
@@ -820,7 +892,7 @@ void ScreenCapturerSckImpl::ConfigurationFinished(SCStream* source, uint64_t gen
 
 void ScreenCapturerSckImpl::RecoverCapture(uint64_t generation,
                                           const std::string& reason,
-                                          SCStream* stopped_stream, bool retry) {
+                                          CaptureInterruption cause, SCStream* stopped_stream) {
   SCStream* old_stream;
   {
     std::lock_guard lock(lock_);
@@ -836,8 +908,8 @@ void ScreenCapturerSckImpl::RecoverCapture(uint64_t generation,
     applied_configuration_ = nil;
     suspended_since_ = {};
     ++configuration_generation_; // Revoke pending completions and frames.
-    recovery_pending_ = retry;
-    if (retry) {
+    recovery_pending_ = cause != CaptureInterruption::user_stop;
+    if (recovery_pending_) {
       const auto delay = std::chrono::seconds(
           std::min(1u << std::min(recovery_attempt_, 3u), 5u));
       recovery_attempt_ = std::min(recovery_attempt_ + 1, 4u);
@@ -848,10 +920,23 @@ void ScreenCapturerSckImpl::RecoverCapture(uint64_t generation,
       ++capture_session_;
       LOG_INFO("ScreenCaptureKit capture ended: {}", reason);
     }
-    // A replacement stream must never inherit an acknowledged privacy filter.
     if (privacy_) {
-      privacy_->Fail(reason);
-      privacy_->CaptureChanged(false);
+      // The enumeration or reconfiguration failure can beat didStopWithError.
+      // Check the old target as well as SCK's specific no-source error.
+      const bool lost_target = cause == CaptureInterruption::failure && current_display_ &&
+          CGRectIsEmpty(CGDisplayBounds(current_display_)) && CGPreflightScreenCaptureAccess();
+      if (privacy_->Engaged() && (cause == CaptureInterruption::display_loss || lost_target)) {
+        // SCK destroyed the filtered stream. Keep the local covers and require
+        // the replacement stream to acknowledge its own complete filter.
+        if (!awaiting_recovery_filter_) {
+          InvalidateMacPrivacyCaptureFilter();
+          awaiting_recovery_filter_ = true;
+        }
+        privacy_->CaptureDisplayLost();
+      } else {
+        privacy_->Fail(reason);
+        privacy_->CaptureChanged(false);
+      }
     }
   }
   [old_stream stopCaptureWithCompletionHandler:nil];
@@ -892,10 +977,8 @@ void ScreenCapturerSckImpl::CaptureStopped(SCStream* source, NSError* error) {
   if (!source) return;
   // The system's explicit Stop Sharing action cancels capture until the next
   // connection. Only unexpected/system interruptions should restart it.
-  const bool user_stopped = [error.domain isEqualToString:SCStreamErrorDomain] &&
-      error.code == SCStreamErrorUserStopped;
   RecoverCapture(0, "ScreenCaptureKit stream stopped: " + NSErrorToString(error),
-                 source, !user_stopped);
+                 ClassifyCaptureError(error), source);
 }
 
 void ScreenCapturerSckImpl::CaptureSuspended(SCStream* source) {
@@ -937,7 +1020,7 @@ void ScreenCapturerSckImpl::OnNewCVPixelBuffer(SCStream* source,
   bool log_native_output = false;
   {
     std::lock_guard<std::mutex> lock(lock_);
-    if (!_on_data || !capture_requested_ || source != stream_) {
+    if (!_on_data || !capture_requested_ || source != stream_ || awaiting_recovery_filter_) {
       return;
     }
     stream_id = ResolveDisplayStreamId(current_stream_id_.c_str(),
@@ -1008,12 +1091,8 @@ void ScreenCapturerSckImpl::StartOrReconfigureCapturer() {
   }
 
   auto handler = ^(SCShareableContent *content, NSError *error) {
-    if (error) {
-      LOG_ERROR("getShareableContent failed: {}", NSErrorToString(error));
-      [local_helper onShareableContentCreated:nil generation:generation revision:revision];
-      return;
-    }
-    [local_helper onShareableContentCreated:content generation:generation revision:revision];
+    [local_helper onShareableContentCreated:content generation:generation
+                                    revision:revision error:error];
   };
   [SCShareableContent getShareableContentExcludingDesktopWindows:NO
                                            onScreenWindowsOnly:NO
@@ -1061,7 +1140,7 @@ void ScreenCapturerSckImpl::StartOrReconfigureCapturer() {
   // geometry and update the stream's pixel dimensions and input bounds.
   dispatch_async(_completion_queue, ^{
     std::lock_guard<std::mutex> lock(self->_capturer_lock);
-    if (self->_capturer) self->_capturer->CaptureConfigurationChanged();
+    if (self->_capturer) self->_capturer->ScreenParametersChanged();
   });
 }
 - (void)configurationFinished:(SCStream*)stream generation:(uint64_t)generation
@@ -1080,11 +1159,11 @@ void ScreenCapturerSckImpl::StartOrReconfigureCapturer() {
   });
 }
 - (void)onShareableContentCreated:(SCShareableContent *)content generation:(uint64_t)generation
-                       revision:(uint64_t)revision {
+                       revision:(uint64_t)revision error:(NSError*)error {
   dispatch_async(_completion_queue, ^{
     std::lock_guard<std::mutex> lock(self->_capturer_lock);
     if (self->_capturer)
-      self->_capturer->OnShareableContentCreated(content, generation, revision);
+      self->_capturer->OnShareableContentCreated(content, generation, revision, error);
   });
 }
 

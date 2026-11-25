@@ -234,8 +234,9 @@ int SessionDeviceManager::InitializeScreenCapturer() {
           return;
         }
 
+        const auto stream_count = registered_display_stream_count_.load();
         const std::string stream_id = ResolveDisplayStreamId(
-            display_name, registered_display_stream_count_, -1,
+            display_name, stream_count, -1,
             last_video_frame_stream_id_);
         if (stream_id.empty()) {
           if (!invalid_video_stream_id_logged_) {
@@ -243,7 +244,7 @@ int SessionDeviceManager::InitializeScreenCapturer() {
                 "Drop captured frames with an empty or unregistered video "
                 "stream id, reported='{}', registered_streams={}",
                 display_name ? display_name : "",
-                registered_display_stream_count_);
+                stream_count);
             invalid_video_stream_id_logged_ = true;
           }
           return;
@@ -456,17 +457,25 @@ bool SessionDeviceManager::SyncDisplayInfo() {
   // Called every UI tick; replace the shared list only when geometry actually
   // changed so readers on other threads rarely contend for the lock.
   bool changed = false;
+#ifdef __APPLE__
+  bool release_buttons = false;
+#endif
   {
     std::lock_guard<std::mutex> lock(display_info_mutex_);
-    changed = !std::equal(
-        displays.begin(), displays.end(), display_info_list_.begin(),
-        display_info_list_.end(), [](const auto &a, const auto &b) {
-          return a.handle == b.handle && a.name == b.name &&
-                 a.is_primary == b.is_primary && a.left == b.left &&
-                 a.top == b.top && a.width == b.width && a.height == b.height;
-        });
-    if (changed) display_info_list_ = displays;
+    changed = displays != display_info_list_;
+    if (changed) {
+#ifdef __APPLE__
+      const size_t selected = owner_.selected_display_.load();
+      release_buttons = selected < display_info_list_.size() &&
+                        (selected >= displays.size() ||
+                         displays[selected].handle != display_info_list_[selected].handle);
+#endif
+      display_info_list_ = displays;
+    }
   }
+#ifdef __APPLE__
+  if (release_buttons) ReleaseRemoteMouseButtons();
+#endif
   if (changed) {
     std::lock_guard lock(mouse_controller_mutex_);
     if (mouse_controller_) mouse_controller_->UpdateDisplayInfoList(displays);
@@ -719,6 +728,32 @@ void SessionDeviceManager::PushAudio(const std::string& remote_id,
   }
 }
 
+void SessionDeviceManager::RefreshIdleDisplays() {
+  bool recreate_peer = false;
+  size_t display_count = 0;
+  std::shared_lock admission(owner_.connection_status_mutex_, std::defer_lock);
+  const auto accept = [&](size_t count) {
+    if (owner_.lan_ && owner_.lan_->HasIncomingSession()) return false;
+    admission.lock();
+    if (!owner_.connection_status_.empty()) return false;
+    {
+      std::lock_guard lock(owner_.controller_trust_mutex_);
+      if (!owner_.controller_trust_.empty()) return false;
+    }
+    display_count = count;
+    // Cloud peers negotiate their registered streams when a viewer joins.
+    // Retire only the listening peer, before a new callback can enter.
+    recreate_peer = owner_.peer_ && count != registered_display_stream_count_.load();
+    return !recreate_peer || owner_.peer_events_->StopAcceptingIfIdle();
+  };
+  if (!screen_capturer_->RefreshIdleDisplays(accept)) return;
+  SyncDisplayInfo();
+  registered_display_stream_count_ = display_count;
+  owner_.selected_display_ = 0;
+  admission.unlock();
+  if (recreate_peer) owner_.CloseConnectionPeer();
+}
+
 void SessionDeviceManager::UpdateInteractions() {
   // Restore the previous session's modes and apply the new controller's saved
   // selections before starting capture or allowing an early input return.
@@ -742,7 +777,8 @@ void SessionDeviceManager::UpdateInteractions() {
   bool capture_needed = !controllers.empty();
 #if defined(__linux__) && !defined(__OHOS__)
   // Preserve a running Wayland portal across reconnects.
-  capture_needed = capture_needed || (owner_.screen_capturer_is_started_ && IsWaylandSession());
+  capture_needed = capture_needed || (owner_.screen_capturer_is_started_ &&
+      static_cast<ScreenCapturerLinux*>(screen_capturer_)->UsesWaylandPortal());
 #endif
   if (capture_needed && !owner_.screen_capturer_is_started_) {
     const auto now = std::chrono::steady_clock::now();
@@ -757,6 +793,8 @@ void SessionDeviceManager::UpdateInteractions() {
   } else if (!capture_needed && owner_.screen_capturer_is_started_) {
     StopScreenCapturer();
   }
+  if (!capture_needed && !owner_.screen_capturer_is_started_ && screen_capturer_)
+    RefreshIdleDisplays();
   if (!capture_needed) next_capture_start_retry_ = {};
   screen_sharing_power_.SetSharing(!controllers.empty() && owner_.screen_capturer_is_started_);
 
@@ -777,7 +815,7 @@ void SessionDeviceManager::UpdateInteractions() {
   }
 
   if (owner_.screen_capturer_is_started_ && SyncDisplayInfo()) {
-#if defined(_WIN32) || defined(__OHOS__)
+#if defined(_WIN32) || defined(__OHOS__) || defined(__linux__)
     const int active_display = screen_capturer_->GetCurrentMonitorIndex();
     const auto displays = display_info_list();
     if (active_display >= 0 &&

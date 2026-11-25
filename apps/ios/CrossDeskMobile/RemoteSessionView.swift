@@ -75,6 +75,8 @@ struct RemoteSessionView: View {
     @GestureState private var statusOrbDragTranslation = CGSize.zero
 
     var body: some View {
+        let isPhone = UIDevice.current.userInterfaceIdiom == .phone
+        let videoEdges: Edge.Set = hasVerticalSystemBar ? .all : (isPhone ? .bottom : [])
         ZStack {
             Color.black.ignoresSafeArea()
             GeometryReader { proxy in
@@ -160,9 +162,9 @@ struct RemoteSessionView: View {
                 .frame(width: proxy.size.width, height: proxy.size.height)
                 .clipped()
             }
-            // Give the video, cursor and touch surface the same full window on
-            // vertical-bar layouts. Floating controls retain their own safe area.
-            .ignoresSafeArea(.container, edges: hasVerticalSystemBar ? .all : [])
+            // Video and input can use the home indicator area together.
+            // Floating controls still use the safe area around the display cutout.
+            .ignoresSafeArea(.container, edges: videoEdges)
             .ignoresSafeArea(.keyboard)
             .transaction { transaction in
                 transaction.animation = nil
@@ -214,7 +216,8 @@ struct RemoteSessionView: View {
                     .zIndex(50)
             }
         }
-        .statusBarHidden(hasVerticalSystemBar)
+        .statusBarHidden(isPhone || hasVerticalSystemBar)
+        .persistentSystemOverlays(isPhone ? .hidden : .automatic)
         .alert(NSLocalizedString("升级提示", comment: ""), isPresented: Binding(
             get: { !session.privacyScreen.unlockNotice && session.remoteUpdateMessage != nil },
             set: { if !$0 && !session.privacyScreen.unlockNotice { session.dismissRemoteUpdate() } }
@@ -1548,36 +1551,30 @@ private struct FloatingNetworkStatistics: View {
 
 private struct FloatingVideoSettings: View {
     @ObservedObject var session: RemoteSessionModel
+    @State private var showingResolutions = false
 
     var body: some View {
+        let display = session.displayResolutions.display(session.selectedDisplay)
+        let canChooseResolution = session.isConnected && !session.displayResolutions.pending
+            && !session.privacyScreen.unlockNotice && display?.modes.isEmpty == false
+
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 5) {
                 Text(NSLocalizedString("被控端分辨率", comment: ""))
                     .font(.caption).foregroundStyle(.secondary)
-                let display = session.displayResolutions.display(session.selectedDisplay)
-                Menu {
-                    ForEach(Array(Set(display?.modes ?? [])).sorted {
-                        $0.width == $1.width ? $0.height > $1.height : $0.width > $1.width
-                    }, id: \.self) { mode in
-                        Button {
-                            if let display {
-                                session.updateDisplayResolution(mode, displayID: display.display_id, displayKey: display.display_key)
-                            }
-                        } label: {
-                            if mode == display?.current { Label(mode.label, systemImage: "checkmark") }
-                            else { Text(mode.label) }
-                        }
-                    }
+                Button {
+                    showingResolutions = true
                 } label: {
                     HStack {
                         Text(display?.current.label ?? NSLocalizedString("设备不支持", comment: ""))
                         Spacer()
-                        Image(systemName: "chevron.up.chevron.down")
+                        Image(systemName: "chevron.forward")
+                            .accessibilityHidden(true)
                     }
                     .font(.subheadline).padding(8)
                     .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 7))
                 }
-                .disabled(!session.isConnected || session.displayResolutions.pending || (display?.modes.isEmpty ?? true))
+                .disabled(!canChooseResolution)
                 if session.displayResolutions.pending {
                     Text(NSLocalizedString("等待电脑端确认…", comment: "")).font(.caption).foregroundStyle(.secondary)
                 } else if session.displayResolutions.failed {
@@ -1602,6 +1599,16 @@ private struct FloatingVideoSettings: View {
                        ))
         }
         .padding(.vertical, 2)
+        .sheet(isPresented: $showingResolutions) {
+            if let display {
+                DisplayResolutionList(display: display) { mode in
+                    session.updateDisplayResolution(mode, displayID: display.display_id, displayKey: display.display_key)
+                }
+            }
+        }
+        .onValueChange(of: canChooseResolution ? display?.display_key : nil) { _ in
+            showingResolutions = false
+        }
     }
 
     private func settingRow(_ title: String, options: [String], values: [Int],
@@ -1617,6 +1624,40 @@ private struct FloatingVideoSettings: View {
             }
             .pickerStyle(.segmented)
             .disabled(!session.canChangeVideoSettings)
+        }
+    }
+}
+
+private struct DisplayResolutionList: View {
+    let display: RemoteDisplayResolutionInfo
+    let select: (RemoteDisplayResolution) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        let modes = Set(display.modes).sorted { ($0.width, $0.height) > ($1.width, $1.height) }
+        NavigationStack {
+            List(modes, id: \.self) { mode in
+                Button {
+                    select(mode)
+                    dismiss()
+                } label: {
+                    HStack {
+                        Text(mode.label).foregroundStyle(.primary)
+                        Spacer()
+                        if mode == display.current {
+                            Image(systemName: "checkmark").accessibilityHidden(true)
+                        }
+                    }
+                }
+                .accessibilityAddTraits(mode == display.current ? .isSelected : [])
+            }
+            .navigationTitle(NSLocalizedString("被控端分辨率", comment: ""))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(NSLocalizedString("取消", comment: "")) { dismiss() }
+                }
+            }
         }
     }
 }
