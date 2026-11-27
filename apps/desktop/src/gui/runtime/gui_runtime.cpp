@@ -123,6 +123,15 @@ void GuiRuntime::SendRemoteInput(const RemoteAction& action, float wheel_delta) 
       scaled.type = ControlType::mouse;
       scaled.m = action.m;
       scaled.m.s = steps;
+#ifdef _WIN32
+      if (action.m.flag == MouseFlag::wheel_horizontal) {
+        std::lock_guard version_lock(props->remote_version_mutex_);
+        // winit negates WM_MOUSEHWHEEL. Windows injection expects the native sign.
+        if (props->remote_platform_ == HostPlatform::Windows) {
+          scaled.m.s = -steps;
+        }
+      }
+#endif
       message = scaled.to_json();
     }
     if (mouse) {
@@ -144,10 +153,15 @@ void GuiRuntime::SendRemoteInput(const RemoteAction& action, float wheel_delta) 
   }
 }
 
-bool GuiRuntime::PrepareSharedGuiIdentity(bool import_existing) {
+bool GuiRuntime::PrepareSharedGuiIdentity(bool import_existing,
+                                         std::string* error_out) {
+  if (error_out) error_out->clear();
 #ifdef _WIN32
   if (!SupportsServiceAutostart() || shared_identity_) return true;
-  if (!import_existing && settings_.Save() != 0) return false;
+  if (!import_existing && settings_.Save() != 0) {
+    if (error_out) *error_out = "Cannot save local settings";
+    return false;
+  }
   if (peer_) {
     CloseConnectionPeer();
     WaitForSessionCleanup();
@@ -157,14 +171,35 @@ bool GuiRuntime::PrepareSharedGuiIdentity(bool import_existing) {
       path_manager_->GetCachePath(), path_manager_->GetConfigPath() / "trusted-devices",
       config_center_->ExportSharedHostConfig(), error)) {
     LOG_ERROR("Cannot prepare persistent host: {}", error);
+    if (error_out) *error_out = error;
     return false;
   }
-  auto identity = SharedHostIdentity::AttachGui(path_manager_->GetCachePath(),
-      path_manager_->GetConfigPath() / "trusted-devices", import_existing, error);
-  if (!identity ||
-      (import_existing && config_center_->ApplySharedHostConfig(identity->HostConfig()) != 0)) {
-    LOG_ERROR("Cannot load the machine identity: {}", error);
-    return false;
+  const auto cache = path_manager_->GetCachePath();
+  const auto trusted = path_manager_->GetConfigPath() / "trusted-devices";
+  std::unique_ptr<SharedHostIdentity> identity;
+  constexpr unsigned max_retries = 3;
+  for (unsigned attempt = 0;; ++attempt) {
+    bool retryable = false;
+    if (!identity) {
+      identity = SharedHostIdentity::AttachGui(cache, trusted, import_existing,
+                                              error, retryable);
+    }
+    if (identity) {
+      if (!import_existing ||
+          config_center_->ApplySharedHostConfig(identity->HostConfig(), &retryable) == 0) {
+        break;
+      }
+      error = retryable ? "Cannot save shared host configuration"
+                        : "Invalid shared host configuration";
+    }
+    if (!retryable || !import_existing || attempt == max_retries) {
+      LOG_ERROR("Cannot load the machine identity: {}", error);
+      if (error_out) *error_out = error;
+      return false;
+    }
+    // Keep the GUI attached while retrying a config save. A process restart
+    // would lose both the claim and the retry budget.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250u << attempt));
   }
   shared_identity_ = std::move(identity);
   managed_host_frontend_ = true;
@@ -404,6 +439,21 @@ int GuiRuntime::CreateConnectionPeer() {
   return -1;
 }
 
+void GuiRuntime::ReloadRecentConnections() {
+  int ret = thumbnail_->LoadThumbnail(recent_connections_);
+  if (!ret) {
+    LOG_INFO("Load recent connection thumbnails");
+  }
+  reload_recent_connections_ = false;
+
+  recent_connection_ids_.clear();
+  for (const auto &conn : recent_connections_) {
+    if (conn.second.lan.address.empty())
+      recent_connection_ids_.push_back(conn.first);
+  }
+  need_to_send_recent_connections_ = true;
+}
+
 void GuiRuntime::HandleRecentConnections() {
   if (thumbnail_ && session_cleanup_tasks_.empty()) {
     std::vector<std::shared_ptr<RemoteSession>> sessions;
@@ -428,15 +478,14 @@ void GuiRuntime::HandleRecentConnections() {
       const auto direct = props->lan_session_;
       const Thumbnail::LanTarget target =
           direct ? Thumbnail::LanTarget{direct->target.address,
-                                        direct->target.device_id,
                                         direct->target.port}
                  : Thumbnail::LanTarget{};
       const auto record_id =
-          direct ? Thumbnail::LanRecordId(target.device_id) : props->remote_id_;
-      if (thumbnail_->SaveToThumbnail(
+          direct ? Thumbnail::LanRecordId(target.address, target.port) : props->remote_id_;
+      if (props->history_store_ && props->history_store_->SaveToThumbnail(
               nullptr, 0, 0, record_id, host_name,
               props->remember_password_ ? props->remote_password_ : "",
-              platform, direct ? &target : nullptr) == 0)
+              platform, direct ? &target : nullptr, props->history_generation_) == 0)
         reload_recent_connections_ = true;
       else
         LOG_ERROR("Failed to save recent connection");
@@ -445,18 +494,7 @@ void GuiRuntime::HandleRecentConnections() {
   if (session_cleanup_tasks_.empty() && reload_recent_connections_ && thumbnail_) {
     uint32_t now_time = SDL_GetTicks();
     if (now_time - recent_connection_image_save_time_ >= 50) {
-      int ret = thumbnail_->LoadThumbnail(recent_connections_);
-      if (!ret) {
-        LOG_INFO("Load recent connection thumbnails");
-      }
-      reload_recent_connections_ = false;
-
-      recent_connection_ids_.clear();
-      for (const auto &conn : recent_connections_) {
-        if (conn.second.lan.device_id.empty())
-          recent_connection_ids_.push_back(conn.first);
-      }
-      need_to_send_recent_connections_ = true;
+      ReloadRecentConnections();
     }
   }
 }

@@ -106,6 +106,7 @@ class GuiRuntime : protected gui_detail::GuiState {
   int ForceSignalReconnect();
 
   void HandleRecentConnections();
+  void ReloadRecentConnections();
   void HandleConnectionStatusChange();
   void HandlePendingRejoins();
   void CancelPendingConnection(const std::string& remote_id);
@@ -122,7 +123,8 @@ class GuiRuntime : protected gui_detail::GuiState {
   bool IsAuthorizedController(const std::string& remote_id);
   void InitializeTrustedDevices(const std::filesystem::path& directory);
   bool PublishSharedIdentity(bool include_config = false);
-  bool PrepareSharedGuiIdentity(bool import_existing);
+  bool PrepareSharedGuiIdentity(bool import_existing,
+                                std::string* error_out = nullptr);
   bool TrustedControllerAllowed(const std::string& remote_id);
   bool BeginControllerTrust(const std::string& remote_id, PeerEventHandler* events);
   void ForgetControllerTrust(const std::string& remote_id, PeerEventHandler* events);

@@ -51,7 +51,8 @@ private:
   };
 
   void InitializeLogger();
-  void InitializeSettings();
+  bool InitializeSettings();
+  void LoadHistoryWorkspace();
   bool InitializeSDL();
   void InitializeModules();
   void InitializeUi();
@@ -88,6 +89,7 @@ private:
   void DeviceGroupAction(const std::string& action, const std::string& value,
                          bool gallery_window);
   bool SaveDeviceGroups(const std::string& new_group, bool gallery_window);
+  bool DeleteGroup(const std::string& name);
   void ReleasePressedInput(bool preserve_local_ui = false);
   void ReleaseControl(bool preserve_local_ui = false);
   void SyncAudioPlayback();
@@ -127,6 +129,7 @@ private:
   void ResetSettingsUi(bool gallery_window = false);
   bool ValidateSelfHostedSettingsFromUi(bool gallery_window = false);
   bool SaveSettingsFromUi(bool gallery_window = false);
+  bool PersistSettingsFromUi(bool gallery_window);
   void ApplySettingsFromConfig(bool reconnect);
 #if _WIN32 && CROSSDESK_PORTABLE
   void CheckPortableWindowsService();
@@ -146,6 +149,10 @@ private:
 
   void OpenFileDialog(const std::string& title,
                       std::function<void(std::string)> completion);
+#if _WIN32
+  void PollReceiveFolderDialog();
+  void CancelReceiveFolderDialog();
+#endif
   bool OpenUrl(const std::string &url);
 
   std::unique_ptr<SlintUi> ui_;

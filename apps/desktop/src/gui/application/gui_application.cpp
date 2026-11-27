@@ -31,6 +31,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -64,11 +65,13 @@
 #if _WIN32
 #include <windows.h>
 
+#include "platform/windows/gui/folder_dialog.h"
 #include "platform/windows/gui/slint_backend.h"
 #include "platform/windows/gui/session_end_observer.h"
 #include "platform/windows/gui/tray/win_tray.h"
 #include "platform/windows/gui/window_icons.h"
 #include "platform/windows/gui/window_taskbar.h"
+#include "platform/windows/runtime_daemon.h"
 #include "platform/windows/service/autostart_control.h"
 #include "platform/windows/service/interactive_desktop.h"
 #include "platform/windows/service/unattended_config.h"
@@ -1191,6 +1194,14 @@ struct GuiApplication::SlintUi {
   slint::Timer timer;
   std::shared_ptr<void> file_dialog_lifetime = std::make_shared<int>(0);
   bool file_dialog_open = false;
+#if _WIN32
+  struct ReceiveFolderDialog {
+    bool gallery;
+    std::stop_source stop;
+    std::future<std::string> result;
+  };
+  std::optional<ReceiveFolderDialog> receive_folder_dialog;
+#endif
   std::future<feedback::ExportResult> diagnostic_export;
   std::string diagnostic_saved_path;
   WindowDragState main_drag, gallery_drag;
@@ -1264,7 +1275,32 @@ int GuiApplication::Run(bool login_launch) {
         Sleep(250);
       } while (IsUnattendedEnabled() && !IsCurrentSessionUserDesktopActive());
     }
-    if (!PrepareSharedGuiIdentity(true)) return -1;
+    std::string identity_error;
+    if (!PrepareSharedGuiIdentity(true, &identity_error)) {
+      // Startup has already retried transient I/O. A new process would reset
+      // the retry budget and hide a persistent failure.
+      platform::WindowsRuntimeDaemon::Instance().Shutdown(false);
+      if (!login_launch) {
+        std::wstring text =
+            L"CrossDesk could not attach to the shared machine identity.\n\n";
+        if (!identity_error.empty()) {
+          const int needed = MultiByteToWideChar(
+              CP_UTF8, 0, identity_error.data(),
+              static_cast<int>(identity_error.size()), nullptr, 0);
+          if (needed > 0) {
+            std::wstring wide_error(static_cast<size_t>(needed), L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, identity_error.data(),
+                                static_cast<int>(identity_error.size()),
+                                wide_error.data(), needed);
+            text += L"Reason: " + wide_error + L"\n\n";
+          }
+        }
+        text += L"Correct the reported problem, then open CrossDesk again.";
+        MessageBoxW(nullptr, text.c_str(), L"CrossDesk",
+                    MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+      }
+      return -1;
+    }
   }
 #endif
   InitializeTrustedDevices(path_manager_->GetConfigPath() / "trusted-devices");
@@ -1284,14 +1320,14 @@ int GuiApplication::Run(bool login_launch) {
 
 #if defined(__linux__) && !defined(__OHOS__)
   try {
-    InitializeSettings();
+    if (!InitializeSettings()) return -1;
   } catch (const std::system_error&) {
     // Credential I/O errors are logged by SettingsManager. Exit cleanly rather
     // than initializing a new identity or crashing with an uncaught exception.
     return -1;
   }
 #else
-  InitializeSettings();
+  if (!InitializeSettings()) return -1;
 #endif
 #ifdef _WIN32
   // Older credential caches and trust stores are available after settings initialization.
@@ -1365,12 +1401,12 @@ int GuiApplication::Run(bool login_launch) {
 
 void GuiApplication::InitializeLogger() { InitLogger(exec_log_path_); }
 
-void GuiApplication::InitializeSettings() {
+bool GuiApplication::InitializeSettings() {
   settings_.Load();
-  if (thumbnail_->SetSavePreviews(config_center_->IsSaveRemotePreviews()) != 0) {
-    LOG_ERROR("Failed to clear saved remote previews");
-  }
-  settings_.LoadRecentConnectionAliases();
+  if (!settings_.UpgradeHistory()) return false;
+  settings_.SelectHistoryServer();
+  settings_.ApplyPreviewPreference();
+  ReloadRecentConnections();
   if (!remote_resolutions_.Load(
           std::filesystem::path(cache_path_) / "remote_display_resolutions.json"))
     LOG_WARN("Could not load remembered remote display resolutions");
@@ -1379,6 +1415,7 @@ void GuiApplication::InitializeSettings() {
   localization_language_ =
       static_cast<ConfigCenter::LANGUAGE>(language_button_value_);
   SyncPrivacyScreenSettings();
+  return true;
 }
 
 bool GuiApplication::InitializeSDL() {
@@ -1513,9 +1550,7 @@ void GuiApplication::InitializeUi() {
   ui_->main->set_release_note_blocks(ui_->release_note_blocks_model);
   RegisterFontAwesome(ui_->main->window());
   ui_->main->set_recent_connections(ui_->recent_model);
-  ui_->gallery_path = std::filesystem::path(cache_path_) / "deskhub.json";
-  if (!ui_->gallery.Load(ui_->gallery_path))
-    LOG_WARN("Could not load DeskHub workspace; original file retained");
+  LoadHistoryWorkspace();
   ui_->wall->set_gallery_tiles(ui_->gallery_model);
   ui_->wall->set_gallery_selected_devices(ui_->gallery_selected_model);
   ui_->wall->set_gallery_network_devices(ui_->gallery_network_model);
@@ -1534,7 +1569,7 @@ void GuiApplication::InitializeUi() {
 #endif
   ui_->gallery_window.wall_size = default_gallery_size;
   try {
-    std::ifstream file(ui_->gallery_path.string() + ".window");
+    std::ifstream file(std::filesystem::path(cache_path_) / "deskhub.json.window");
     if (file) {
       const auto saved = nlohmann::json::parse(file);
       const float scale = std::max(ui_->main->window().scale_factor(), 1.0f);
@@ -1687,6 +1722,12 @@ void GuiApplication::ResetSettingsUi(bool gallery_window) {
   if (!ui_) {
     return;
   }
+#if _WIN32
+  if (ui_->receive_folder_dialog &&
+      ui_->receive_folder_dialog->gallery == gallery_window) {
+    CancelReceiveFolderDialog();
+  }
+#endif
   auto& main = ui_->Window(gallery_window);
   main->set_language_index(language_button_value_);
   main->set_codec_index(video_encode_format_button_value_);
@@ -1831,6 +1872,9 @@ void GuiApplication::BindMainCallbacks(bool gallery_window) {
       ui_->recent_group_filter = ui_->recent_filter_groups[index - 2];
     else ui_->recent_group_filter.reset();
     SyncMainWindow();
+  });
+  main->on_delete_group([this](slint::SharedString name) {
+    return DeleteGroup(std::string(name));
   });
   main->on_delete_announcement([this](slint::SharedString id,
                                           slint::SharedString revision) {
@@ -2015,7 +2059,7 @@ void GuiApplication::BindMainCallbacks(bool gallery_window) {
       // History is newest first. Match both address and port, and only use
       // the latest matching record when an endpoint has been reused.
       for (const auto& [_, recent] : recent_connections_) {
-        if (recent.lan.device_id.empty() || recent.lan.address != address ||
+        if (recent.lan.address != address ||
             recent.lan.port != port)
           continue;
         if (recent.remember_password && lan::ValidPassword(recent.password)) {
@@ -2085,21 +2129,50 @@ void GuiApplication::BindMainCallbacks(bool gallery_window) {
         recent_connections_.begin(), recent_connections_.end(),
         [&](const auto& entry) { return entry.second.remote_id == remote_id; });
     if (connection != recent_connections_.end()) {
-      thumbnail_->DeleteThumbnail(connection->first);
+      if (thumbnail_->DeleteThumbnail(connection->first) != 0) return;
+      if (ui_->gallery.HasAssignments(remote_id) && !ui_->gallery.Contains(remote_id)) {
+        auto updated = ui_->gallery;
+        updated.Forget(remote_id);
+        if (updated.Save(ui_->gallery_path)) ui_->gallery = std::move(updated);
+      }
       settings_.EraseRecentConnectionAlias(remote_id);
       settings_.SaveRecentConnectionAliases();
       reload_recent_connections_ = true;
     }
   });
-  main->on_browse_save_path([this, main] {
+  main->on_browse_save_path([this, main, gallery_window] {
+    const auto& title =
+        localization::file_transfer_save_path[localization_language_index_];
+#if _WIN32
+    if (exit_ || ui_->file_dialog_open) return;
+    const HWND owner = main->window().win32_hwnd();
+    if (!owner) return;
+    try {
+      std::stop_source stop;
+      std::packaged_task<std::string()> select(
+          [owner, title, initial_folder = std::string(main->get_file_save_path()),
+           token = stop.get_token()] {
+            return ChooseWindowsFolder(owner, title, initial_folder, token);
+          });
+      auto result = select.get_future();
+      std::thread(std::move(select)).detach();
+      ui_->receive_folder_dialog.emplace(gallery_window, std::move(stop),
+                                         std::move(result));
+      main->set_receive_folder_pending(true);
+      ui_->file_dialog_open = true;
+    } catch (const std::system_error& error) {
+      LOG_WARN("Failed to start the Windows folder picker: {}", error.what());
+    }
+#else
+    (void)gallery_window;
     const char* folder = tinyfd_selectFolderDialog(
-        localization::file_transfer_save_path[localization_language_index_]
-            .c_str(),
+        title.c_str(),
         file_transfer_save_path_buf_[0] ? file_transfer_save_path_buf_
                                         : nullptr);
     if (folder) {
       main->set_file_save_path(folder);
     }
+#endif
   });
   BindTrustedDeviceCallbacks(gallery_window);
   main->on_save_settings([this, main] {
@@ -2633,6 +2706,7 @@ void GuiApplication::Tick() {
   }
   PollDiagnosticExport();
 #ifdef _WIN32
+  PollReceiveFolderDialog();
   TickLocalHost();
 #endif
   TickLan();
@@ -3638,7 +3712,7 @@ void GuiApplication::SyncMainWindow() {
   std::vector<ui::RecentConnection> model;
   model.reserve(recent_connections_.size());
   for (const auto& [_, connection] : recent_connections_) {
-    if (lan_mode != !connection.lan.device_id.empty()) continue;
+    if (lan_mode != !connection.lan.address.empty()) continue;
     if (!lan_mode &&
         !ui_->gallery.MatchesGroup(connection.remote_id, ui_->recent_group_filter))
       continue;
@@ -3650,7 +3724,7 @@ void GuiApplication::SyncMainWindow() {
     item.group_names = UiText(group_labels[connection.remote_id]);
     item.display_name =
         UiText(settings_.RecentConnectionDisplayName(connection));
-    item.lan = !connection.lan.device_id.empty();
+    item.lan = !connection.lan.address.empty();
     item.endpoint =
         UiText(item.lan ? lan::FormatEndpoint(connection.lan.address,
                                               connection.lan.port)
@@ -4593,7 +4667,7 @@ std::string GuiApplication::SessionDisplayName(const std::string& remote) {
   device.remote_id = remote;
   if (const auto props = FindRemoteSession(remote)) {
     if (const auto direct = props->lan_session_) {
-      device.remote_id = Thumbnail::LanRecordId(direct->target.device_id);
+      device.remote_id = Thumbnail::LanRecordId(direct->target.address, direct->target.port);
     }
     std::lock_guard lock(props->remote_version_mutex_);
     device.remote_host_name = props->remote_host_name_;
@@ -4979,13 +5053,30 @@ bool GuiApplication::ValidateSelfHostedSettingsFromUi(bool gallery_window) {
 }
 
 bool GuiApplication::SaveSettingsFromUi(bool gallery_window) {
+#if _WIN32
+  if (ui_->Window(gallery_window)->get_receive_folder_pending()) return false;
+#endif
+  const auto previous_server = GetSignalServerSettings(*config_center_);
+  const bool saved = PersistSettingsFromUi(gallery_window);
+  const bool server_changed = previous_server != GetSignalServerSettings(*config_center_);
+  // Individual settings are committed separately. Even if a later setter
+  // fails, the saved endpoint and preview preference already apply.
+  if (saved || server_changed) ApplySettingsFromConfig(server_changed);
+  else settings_.ApplyPreviewPreference();
+  if (saved) {
+    ResetSettingsUi(gallery_window);
+    ui_->gallery_synced = {};
+  }
+  return saved;
+}
+
+bool GuiApplication::PersistSettingsFromUi(bool gallery_window) {
 #ifdef _WIN32
   // A later setter can fail after earlier values were persisted. Reconcile
   // with the host on the next status even when no config request was sent.
   if (managed_host_frontend_)
     local_host_status_.config_dirty = local_host_status_.identity_dirty = true;
 #endif
-  const auto previous_server = GetSignalServerSettings(*config_center_);
   const bool previous_ip_enabled = config_center_->IsIpDirectEnabled();
   const auto previous_connection_mode = config_center_->GetConnectionMode();
   auto& main = ui_->Window(gallery_window);
@@ -5010,11 +5101,14 @@ bool GuiApplication::SaveSettingsFromUi(bool gallery_window) {
       (wall_settings->resolution != ui_->gallery.stream_settings.resolution ||
        wall_settings->frame_rate != ui_->gallery.stream_settings.frame_rate ||
        wall_settings->bandwidth_mbps != ui_->gallery.stream_settings.bandwidth_mbps);
-  auto updated_wall = ui_->gallery;
+  const auto shared_wall_path = std::filesystem::path(cache_path_) / "deskhub.json";
+  gallery::Workspace previous_wall;
+  const bool wall_readable = !wall_changed || previous_wall.Load(shared_wall_path);
+  auto updated_wall = previous_wall;
   if (wall_settings) updated_wall.stream_settings = *wall_settings;
   // Persist the draft first, but leave live sessions unchanged until the
   // common save succeeds. Restore the previous wall file if it fails.
-  if (!wall_settings || (wall_changed && !updated_wall.Save(ui_->gallery_path))) {
+  if (!wall_settings || (wall_changed && (!wall_readable || !updated_wall.Save(shared_wall_path)))) {
     main->set_gallery_settings_error(UiText(
         localization::Literal("保存失败，请重试", localization_language_index_)));
     main->set_settings_tab(1);
@@ -5023,7 +5117,7 @@ bool GuiApplication::SaveSettingsFromUi(bool gallery_window) {
   if ((has_endpoint && config_center_->SetServerEndpoint(
           std::string(main->get_server_host()), *ParsePort(main->get_server_port())) != 0) ||
       config_center_->SetSelfHosted(main->get_self_hosted_enabled()) != 0) {
-    if (wall_changed && !ui_->gallery.Save(ui_->gallery_path))
+    if (wall_changed && !previous_wall.Save(shared_wall_path))
       LOG_ERROR("Failed to restore DeskHub settings after common save failure");
     main->set_self_host_settings_error(UiText(
         localization::self_hosted_save_failed[localization_language_index_]));
@@ -5032,7 +5126,7 @@ bool GuiApplication::SaveSettingsFromUi(bool gallery_window) {
     return false;
   }
   if (config_center_->SetIpDirectEnabled(main->get_ip_direct_enabled_draft()) != 0) {
-    if (wall_changed && !ui_->gallery.Save(ui_->gallery_path))
+    if (wall_changed && !previous_wall.Save(shared_wall_path))
       LOG_ERROR("Failed to restore DeskHub settings after IP direct save failure");
     main->set_settings_save_error(UiText(
         localization::Literal("无法保存 IP 连接设置，请重试。", localization_language_index_)));
@@ -5040,7 +5134,7 @@ bool GuiApplication::SaveSettingsFromUi(bool gallery_window) {
   }
 #if defined(_WIN32) || defined(__APPLE__) || (defined(__linux__) && !defined(__OHOS__))
   if (config_center_->SetLockOnDisconnect(main->get_lock_on_disconnect_enabled()) != 0) {
-    if (wall_changed && !ui_->gallery.Save(ui_->gallery_path))
+    if (wall_changed && !previous_wall.Save(shared_wall_path))
       LOG_ERROR("Failed to restore DeskHub settings after lock preference save failure");
     main->set_settings_save_error(UiText(
         localization::Literal("无法保存断开后锁屏设置，请重试。", localization_language_index_)));
@@ -5048,26 +5142,26 @@ bool GuiApplication::SaveSettingsFromUi(bool gallery_window) {
   }
 #endif
   if (config_center_->SetPrivacyLocalUnlock(main->get_privacy_local_unlock_allowed()) != 0) {
-    if (wall_changed) ui_->gallery.Save(ui_->gallery_path);
+    if (wall_changed) previous_wall.Save(shared_wall_path);
     main->set_settings_save_error(UiText(
         localization::Literal("无法保存隐私屏解锁设置，请重试。", localization_language_index_)));
     return false;
   }
   if (main->get_privacy_black_screen_available() &&
       config_center_->SetPrivacyBlackScreen(main->get_privacy_black_screen()) != 0) {
-    if (wall_changed) ui_->gallery.Save(ui_->gallery_path);
+    if (wall_changed) previous_wall.Save(shared_wall_path);
     main->set_settings_save_error(UiText(
         localization::Literal("保存失败，请重试", localization_language_index_)));
     return false;
   }
   if (config_center_->SetDesktopRealtimeRateControl(main->get_desktop_realtime_rate_control()) != 0) {
-    if (wall_changed) ui_->gallery.Save(ui_->gallery_path);
+    if (wall_changed) previous_wall.Save(shared_wall_path);
     main->set_settings_save_error(UiText(localization::Literal(
         "保存失败，请重试", localization_language_index_)));
     return false;
   }
   if (config_center_->SetPauseVideoWhenMinimized(main->get_pause_video_when_minimized()) != 0) {
-    if (wall_changed && !ui_->gallery.Save(ui_->gallery_path))
+    if (wall_changed && !previous_wall.Save(shared_wall_path))
       LOG_ERROR("Failed to restore DeskHub settings after video pause preference save failure");
     main->set_settings_save_error(UiText(
         localization::Literal("保存失败，请重试", localization_language_index_)));
@@ -5092,7 +5186,7 @@ bool GuiApplication::SaveSettingsFromUi(bool gallery_window) {
     if (config_center_->SetIpDirectEnabled(previous_ip_enabled) != 0 ||
         config_center_->SetConnectionMode(previous_connection_mode) != 0)
       LOG_ERROR("Failed to restore IP availability after listener settings failure");
-    if (wall_changed && !ui_->gallery.Save(ui_->gallery_path))
+    if (wall_changed && !previous_wall.Save(shared_wall_path))
       LOG_ERROR("Failed to restore DeskHub settings after listener settings failure");
     main->set_settings_tab(0);
     main->set_settings_save_error(
@@ -5145,9 +5239,6 @@ bool GuiApplication::SaveSettingsFromUi(bool gallery_window) {
   if (config_center_->SetSaveRemotePreviews(main->get_save_remote_previews()) != 0) {
     LOG_ERROR("Failed to save remote preview preference");
   }
-  if (thumbnail_->SetSavePreviews(config_center_->IsSaveRemotePreviews()) != 0) {
-    LOG_ERROR("Failed to clear saved remote previews");
-  }
   reload_recent_connections_ = true;
 #if defined(_WIN32) || defined(__APPLE__) || (defined(__linux__) && !defined(__OHOS__))
   if (config_center_->SetPrivacyScreen(main->get_privacy_on_connect_enabled()) !=
@@ -5183,14 +5274,64 @@ bool GuiApplication::SaveSettingsFromUi(bool gallery_window) {
         "保存失败，请重试", localization_language_index_)));
     return false;
   }
-  ApplySettingsFromConfig(previous_server !=
-                          GetSignalServerSettings(*config_center_));
-  ResetSettingsUi(gallery_window);
-  ui_->gallery_synced = {};
   return true;
 }
 
+void GuiApplication::LoadHistoryWorkspace() {
+  ui_->gallery = {};
+  ui_->gallery_path = settings_.HistoryDirectory() / "deskhub.json";
+  if (!ui_->gallery.Load(ui_->gallery_path))
+    LOG_WARN("Could not load DeskHub workspace; original file retained");
+  gallery::Workspace shared;
+  if (shared.Load(std::filesystem::path(cache_path_) / "deskhub.json"))
+    ui_->gallery.stream_settings = shared.stream_settings;
+}
+
 void GuiApplication::ApplySettingsFromConfig(bool reconnect) {
+  const bool changed_history = settings_.SelectHistoryServer();
+  settings_.ApplyPreviewPreference();
+  if (changed_history) {
+    if (ui_) ReleaseControl();
+    CloseAllRemoteSessions();
+    ReloadRecentConnections();
+    device_presence_cache_.SetSignalConnected(false);
+    gallery_presence_ids_.clear();
+    {
+      std::lock_guard lock(pending_presence_probe_mutex_);
+      pending_presence_probe_ = false;
+      pending_presence_result_ready_ = false;
+      pending_presence_remote_id_.clear();
+      pending_presence_password_.clear();
+      pending_presence_remember_password_ = false;
+    }
+    connection_dialog_target_.clear();
+    show_connection_status_window_ = false;
+    if (ui_) {
+      ui_->recent_group_filter.reset();
+      ui_->recent_preview_images.clear();
+      ui_->recent_model_signature.clear();
+      ui_->recent_model->set_vector({});
+      ui_->gallery_previews.clear();
+      ui_->gallery_pending_previews.clear();
+      ui_->gallery_ids.clear();
+      ui_->gallery_focus.clear();
+      ui_->gallery_auth_id.clear();
+      ui_->gallery_requested_auth.clear();
+      ui_->batch_operations.clear();
+      ui_->gallery_hidden_active_ids.clear();
+      ui_->gallery_recent_model->set_vector({});
+      ui_->gallery_network_model->set_vector({});
+      ui_->gallery_model->set_vector({});
+      ui_->gallery_selected_model->set_vector({});
+      ui_->wall->set_gallery_group_index(0);
+      ui_->wall->invoke_reset_gallery_transient();
+      for (const auto& window : {ui_->main, ui_->wall})
+        window->invoke_reset_history_view();
+      LoadHistoryWorkspace();
+      ui_->gallery_synced = {};
+      SyncMainWindow();
+    }
+  }
   language_button_value_ = static_cast<int>(config_center_->GetLanguage());
   localization_language_index_ = localization::detail::ClampLanguageIndex(language_button_value_);
   localization_language_ = config_center_->GetLanguage();
@@ -5223,6 +5364,7 @@ void GuiApplication::ApplySettingsFromConfig(bool reconnect) {
     if (!ui_->wall->get_settings_open()) ResetSettingsUi(true);
   }
   ApplyLanSettings();
+  if (changed_history) return;
   if (reconnect && !HasActiveSession()) {
     // Tick recreates the peer after asynchronous cleanup, using the committed
     // configuration. Keep the application and its console running throughout.
@@ -5257,7 +5399,7 @@ void GuiApplication::ConnectFromUi(const std::string& input) {
       return;
     }
     for (const auto& [_, recent] : recent_connections_)
-      if (recent.remote_id == input && !recent.lan.device_id.empty()) {
+      if (recent.remote_id == input && !recent.lan.address.empty()) {
         ui_->main->invoke_request_lan_connection(
             UiText(lan::FormatEndpoint(recent.lan.address, recent.lan.port)));
         return;
@@ -5539,6 +5681,35 @@ void GuiApplication::OpenFileDialog(const std::string& title,
   finished(path ? path : "");
 #endif
 }
+
+#if _WIN32
+void GuiApplication::CancelReceiveFolderDialog() {
+  auto& picker = ui_->receive_folder_dialog;
+  if (!picker) return;
+  picker->stop.request_stop();
+  ui_->Window(picker->gallery)->set_receive_folder_pending(false);
+  picker.reset();
+  ui_->file_dialog_open = false;
+}
+
+void GuiApplication::PollReceiveFolderDialog() {
+  auto& picker = ui_->receive_folder_dialog;
+  if (!picker || picker->result.wait_for(0ms) != std::future_status::ready) return;
+
+  auto& window = ui_->Window(picker->gallery);
+  try {
+    const auto path = picker->result.get();
+    if (window->get_settings_open() && !path.empty()) {
+      window->set_file_save_path(UiText(path));
+    }
+  } catch (const std::exception& error) {
+    LOG_WARN("Windows folder selection failed: {}", error.what());
+  }
+  window->set_receive_folder_pending(false);
+  picker.reset();
+  ui_->file_dialog_open = false;
+}
+#endif
 
 void GuiApplication::ExportDiagnosticLogs() {
   if (!ui_ || exit_ || ui_->file_dialog_open || ui_->diagnostic_export.valid()) return;
@@ -5842,7 +6013,7 @@ void GuiApplication::SaveGalleryWindowState() {
     }
     const auto text = state.dump();
     if (text != ui_->saved_window_signature &&
-        gallery::WriteAtomically(ui_->gallery_path.string() + ".window", text))
+        gallery::WriteAtomically(std::filesystem::path(cache_path_) / "deskhub.json.window", text))
       ui_->saved_window_signature = text;
     ui_->window_saved = now;
   }
@@ -6020,6 +6191,37 @@ bool GuiApplication::SaveDeviceGroups(const std::string& new_group,
   return true;
 }
 
+bool GuiApplication::DeleteGroup(const std::string& name) {
+  auto updated = ui_->gallery;
+  if (!updated.DeleteGroup(name)) return true;
+  if (!updated.Save(ui_->gallery_path)) return false;
+
+  const auto removed = std::find(ui_->gallery.groups.begin(), ui_->gallery.groups.end(), name);
+  const int removed_index = int(removed - ui_->gallery.groups.begin()) + 1;
+  const int selected = ui_->wall->get_gallery_group_index();
+  ui_->gallery = std::move(updated);
+  if (selected == removed_index) ui_->wall->set_gallery_group_index(0);
+  else if (selected > removed_index) ui_->wall->set_gallery_group_index(selected - 1);
+  if (ui_->recent_group_filter == name) ui_->recent_group_filter.reset();
+
+  // A device editor can still be open in the other window.
+  for (auto& editor : ui_->group_editors) {
+    if (editor.options->row_count() == 0) continue;
+    std::vector<ui::DeviceGroupOption> options;
+    for (size_t row = 0; row < editor.options->row_count(); ++row) {
+      auto option = *editor.options->row_data(row);
+      if (std::string(option.name) != name) options.push_back(option);
+    }
+    options.front().selected = std::none_of(options.begin() + 1, options.end(),
+        [](const auto& option) { return option.selected; });
+    editor.options->set_vector(options);
+  }
+  ui_->gallery_synced = {};
+  SyncMainWindow();
+  SyncGallery();
+  return true;
+}
+
 void GuiApplication::GalleryAction(const std::string& action,
                                    const std::string& value,
                                    bool gallery_window) {
@@ -6051,7 +6253,7 @@ void GuiApplication::GalleryAction(const std::string& action,
     std::set<std::string> seen;
     int available = 0;
     for (const auto& [_, recent] : recent_connections_) {
-      if (!recent.lan.device_id.empty()) continue;
+      if (!recent.lan.address.empty()) continue;
       if (!gallery::Workspace::ValidId(recent.remote_id) ||
           !seen.insert(recent.remote_id).second)
         continue;
@@ -6537,7 +6739,7 @@ void GuiApplication::SyncGallery() {
   };
   const auto name = [this](const std::string& id) {
     for (const auto& [_, recent] : recent_connections_)
-      if (recent.lan.device_id.empty())
+      if (recent.lan.address.empty())
         if (recent.remote_id == id)
           return settings_.RecentConnectionDisplayName(recent);
     Thumbnail::RecentConnection device{};
@@ -6661,7 +6863,7 @@ void GuiApplication::SyncGallery() {
           bool remember = operation.remember_password;
           if (!operation.password)
             for (const auto& [_, recent] : recent_connections_)
-              if (recent.lan.device_id.empty())
+              if (recent.lan.address.empty())
                 if (recent.remote_id == operation.id) {
                   password = recent.password;
                   remember = recent.remember_password;
@@ -6816,7 +7018,7 @@ void GuiApplication::SyncGallery() {
     tile.selected = wall.selected.count(id);
     auto props = FindRemoteSession(id);
     for (const auto& [_, recent] : recent_connections_) {
-      if (!recent.lan.device_id.empty()) continue;
+      if (!recent.lan.address.empty()) continue;
       if (recent.remote_id != id) continue;
       tile.host_name = UiText(recent.remote_host_name);
       break;
@@ -7072,6 +7274,9 @@ void GuiApplication::Cleanup() {
     return;
   }
   ui_->file_dialog_lifetime.reset();
+#if _WIN32
+  CancelReceiveFolderDialog();
+#endif
 #if defined(__APPLE__)
   CancelNativeFileDialog();
 #endif
